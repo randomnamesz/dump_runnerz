@@ -142,6 +142,39 @@ pid_t find_pid(const char* title_id)
 
 int kstuff_toggle(int enable);
 
+/* Detect PS4 game by checking param.sfo CATEGORY field (gd/gp = PS4 disc/patch) */
+int is_ps4_game(const char *cwd)
+{
+  char path[PATH_MAX + 1];
+  FILE *fp;
+  char buf[4096];
+  size_t nread;
+
+  snprintf(path, PATH_MAX, "%s/sce_sys/param.sfo", cwd);
+  fp = fopen(path, "rb");
+  if (!fp)
+    return 0;
+
+  nread = fread(buf, 1, sizeof(buf), fp);
+  fclose(fp);
+
+  /* Search for CATEGORY value in SFO data - "gd" = PS4 disc, "gp" = PS4 patch */
+  for (size_t i = 0; i + 1 < nread; i++)
+  {
+    if (buf[i] == 'g' && (buf[i+1] == 'd' || buf[i+1] == 'p'))
+    {
+      /* Verify it's null-terminated (actual CATEGORY value, not random data) */
+      if (i + 2 < nread && buf[i+2] == '\0')
+      {
+        printf("Detected PS4 game (category: g%c)\n", buf[i+1]);
+        return 1;
+      }
+    }
+  }
+
+  return 0;
+}
+
 int main(int argc, char *argv[])
 {
   app_launch_ctx_t ctx = {.structsize = sizeof(app_launch_ctx_t)};
@@ -156,19 +189,25 @@ int main(int argc, char *argv[])
   struct kevent evt;
   int nev = -1;
   int arg_shift = 0;
+  int ps4_mode = 0;
 
   if (argc < 2)
   {
-    printf("Usage: %s TITLE_ID\n", argv[0]);
+    printf("Usage: %s TITLE_ID [kstuff-toggle=N] [ps4]\n", argv[0]);
     return -1;
   }
 
-  if (argc >= 3)
+  /* Parse optional arguments */
+  for (int i = 2; i < argc; i++)
   {
     size_t len = strlen("kstuff-toggle=");
-    if (strncmp(argv[2], "kstuff-toggle=", len) == 0) {
-      kstuff = atoi(argv[2] + len);
-      arg_shift = 1;
+    if (strncmp(argv[i], "kstuff-toggle=", len) == 0) {
+      kstuff = atoi(argv[i] + len);
+      arg_shift++;
+    }
+    else if (strcmp(argv[i], "ps4") == 0) {
+      ps4_mode = 1;
+      arg_shift++;
     }
   }
 
@@ -180,19 +219,41 @@ int main(int argc, char *argv[])
 
   getcwd(src, PATH_MAX);
 
-  strcpy(dst, "/system_ex/app/");
-  strcat(dst, title_id);
+  /* Auto-detect PS4 game if not explicitly set */
+  if (!ps4_mode)
+  {
+    ps4_mode = is_ps4_game(src);
+  }
+
+  /* PS4 games mount to /user/app/, PS5 games to /system_ex/app/ */
+  if (ps4_mode)
+  {
+    printf("Using PS4 BC mode for %s\n", title_id);
+    strcpy(dst, "/user/app/");
+    strcat(dst, title_id);
+  }
+  else
+  {
+    strcpy(dst, "/system_ex/app/");
+    strcat(dst, title_id);
+  }
 
   sceUserServiceInitialize(0);
   sceUserServiceGetForegroundUser(&ctx.user_id);
 
   if (access(dst, F_OK) != 0)
   {
-    remount_system_ex();
+    if (!ps4_mode)
+    {
+      remount_system_ex();
+    }
     mkdir(dst, 0755);
   }
 
   mount_nullfs(src, dst);
+
+  printf("Mounting %s -> %s\n", src, dst);
+  printf("Launching %s...\n", title_id);
 
   sceSystemServiceLaunchApp(title_id, &argv[2 + arg_shift], &ctx);
   pid = find_pid(title_id);
